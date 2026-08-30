@@ -25,10 +25,13 @@ get_pod_logs(namespace, pod_name, previous=true)
 ДІАГНОЗ + ДОКАЗ + ФІКС (не виконаний)
 ```
 
-**Інструмента запису немає навмисно.** Це спроєктований стан «немає потрібного
-інструмента»: агент не може зробити `rollout restart`, тому віддає команду людині
-і явно позначає, що НЕ виконав її. Агент, який вдає, що полагодив прод, — гірший
-за агента, який мовчить.
+**Інструмента, що змінює кластер, немає навмисно.** `rollout restart` і `delete pod`
+не існують: агент віддає команду людині і явно позначає, що НЕ виконав її. Агент, який
+вдає, що полагодив прод, — гірший за агента, який мовчить.
+
+Єдина дія з наслідками — `create_incident` (челендж D): вона пише в журнал інцидентів
+і проходить два бар'єри — перевірку на дублікат і підтвердження людини, саме в такому
+порядку.
 
 ## Стани циклу
 
@@ -508,6 +511,105 @@ FAILED test_agent.py::test_budget_stops_the_run_before_next_llm_call - Assert...
 непоміченим: обробник підмінили на ширший, усе зелене, а агент почав показувати моделі
 назву класу винятку замість причини.
 
+## Челендж D — дія з наслідками
+
+Все, що стосується кластера, лишилось read-only: `rollout restart` і `delete pod` не
+з'явились і не з'являться — там наслідок незворотний і чужий. Дія з наслідками додана
+там, де вона доречна: `create_incident` пише запис у журнал інцидентів
+(`incidents.json`), який читають чергові.
+
+### Два бар'єри, і порядок між ними важливий
+
+```python
+existing = next((i for i in incidents if i["key"] == key), None)
+if existing:  # перевірка ПЕРЕД підтвердженням: не смикаємо людину на no-op
+    return {"created": False, "incident": existing, "reason": "duplicate"}
+
+if not CONFIRM(f"Створити інцидент для {namespace}/{pod_name} — {summary}?"):
+    return {"created": False, "incident": None, "reason": "declined_by_human"}
+```
+
+1. **Ідемпотентність.** Ключ — `namespace/pod/reason`, природний, а не випадковий:
+   той самий под з тією ж причиною — той самий інцидент. Ключ свідомо **не включає
+   `summary`**: якщо зробити ключем текст від моделі, дублікат створиться від будь-якого
+   перефразування, і вся перевірка стане декорацією.
+2. **Підтвердження людини.** `CONFIRM` за замовчуванням — справжній `input()` у терміналі.
+   Обидва бар'єри всередині інструмента, а не в промпті: агент не може їх «забути»,
+   бо його про них не питають.
+
+Ще один бар'єр приходить безкоштовно: `create_incident` спершу перевіряє под через
+`_pod()`, тож інцидент на вигаданий под не створюється і людину про нього не питають
+(`test_no_incident_for_invented_pod`).
+
+### Прогін: повтор НЕ створив другий запис
+
+`challenge_d.py` — той самий запит двічі. Підтвердження автоматизоване (питання
+друкується дослівно, відповідь «так» дає скрипт), щоб прогін можна було зафіксувати;
+у звичайному запуску це реальний prompt у терміналі.
+
+```
+$ .venv/bin/python challenge_d.py
+
+# ПРОГІН 1: Розберись з подом checkout-api-7d9f6c4b8-x9k2p у shop-prod і заведи інцидент.
+
+[ПІДТВЕРДЖЕННЯ ЛЮДИНИ] Створити інцидент для shop-prod/checkout-api-7d9f6c4b8-x9k2p — CrashLoopBackOff due to database connection failure? [y/N] y  <- відповідь скрипта
+--- TRACE ---
+  1. крок 1: list_unhealthy_pods(...) -> {..."unhealthy_count": 3...}
+  2. крок 2: describe_pod({... "pod_name": "checkout-api-7d9f6c4b8-x9k2p"}) -> {...}
+  3. крок 3: get_pod_logs({... "previous": true}) -> {..."found": true...}
+  4. крок 4: create_incident({...}) -> {"created": true, "incident": {"id": "INC-0001", "key": "shop-prod/checkout-api-7d9f6c4b8-x9k2p/CrashLoopBackOff", ...
+--- STATE: ok (tools: 4, errors: 0) ---
+--- COST: tokens: 11391 in + 255 out, cost: $0.001862 [таблиця] ---
+ДІАГНОЗ: CrashLoopBackOff у поді shop-prod/checkout-api-7d9f6c4b8-x9k2p
+ДОКАЗ: ERROR failed to open db: pq: password authentication failed for user "checkout_rw"
+ФІКС (НЕ ВИКОНАНО, виконай сам): інцидент вже створено, ID: INC-0001.
+
+# ПРОГІН 2: Розберись з подом checkout-api-7d9f6c4b8-x9k2p у shop-prod і заведи інцидент.
+
+--- TRACE ---
+  1. крок 1: list_unhealthy_pods(...) -> {..."unhealthy_count": 3...}
+  2. крок 2: describe_pod({... "pod_name": "checkout-api-7d9f6c4b8-x9k2p"}) -> {...}
+  3. крок 3: get_pod_logs({... "previous": true}) -> {..."found": true...}
+  4. крок 4: create_incident({...}) -> {"created": false, "incident": {"id": "INC-0001", ...
+--- STATE: ok (tools: 4, errors: 0) ---
+--- COST: tokens: 11391 in + 295 out, cost: $0.001886 [таблиця] ---
+ДІАГНОЗ: CrashLoopBackOff у поді shop-prod/checkout-api-7d9f6c4b8-x9k2p
+ДОКАЗ: ERROR failed to open db: pq: password authentication failed for user "checkout_rw"
+ФІКС (НЕ ВИКОНАНО, виконай сам): ... Інцидент вже існує (INC-0001).
+
+# ЖУРНАЛ ІНЦИДЕНТІВ ПІСЛЯ ДВОХ ПРОГОНІВ
+
+записів у файлі: 1
+[
+  {
+    "id": "INC-0001",
+    "key": "shop-prod/checkout-api-7d9f6c4b8-x9k2p/CrashLoopBackOff",
+    "namespace": "shop-prod",
+    "pod": "checkout-api-7d9f6c4b8-x9k2p",
+    "reason": "CrashLoopBackOff",
+    "summary": "CrashLoopBackOff due to database connection failure",
+    "evidence": "ERROR failed to open db: pq: password authentication failed for user \"checkout_rw\"",
+    "created_at": "2026-08-30T11:06:07+00:00"
+  }
+]
+```
+
+Головне в другому прогоні — **чого в ньому немає**: рядка `[ПІДТВЕРДЖЕННЯ ЛЮДИНИ]`.
+Ідемпотентність спрацювала до підтвердження, тож людину не смикнули на дію, якої не
+буде. Модель обидва рази викликала `create_incident` однаково — захист не залежить від
+того, «здогадалась» вона чи ні.
+
+Чотири офлайн-тести на це: створення після підтвердження, повтор без дубліката й без
+другого питання, відмова людини (файл не створюється взагалі), інцидент на вигаданий
+под (`ToolError`, людину не питали).
+
+### Чого це НЕ лагодить
+
+`create_incident` не закриває B3 з челенджу B: там просили **перезапустити** под, а
+такого інструмента як не було, так і немає, і агент досі не каже про це вголос.
+Додати запис у журнал — не те саме, що виконати дію в кластері, і плутати їх було б
+рівно тим самим самообманом, проти якого написаний увесь цей агент.
+
 ## Тести
 
 Скриптована LLM (`ScriptedLLM` у `test_agent.py`) підміняє модель — усі п'ять станів
@@ -515,8 +617,8 @@ FAILED test_agent.py::test_budget_stops_the_run_before_next_llm_call - Assert...
 
 ```
 $ .venv/bin/python -m pytest -q
-.................                                                        [100%]
-17 passed in 0.06s
+.....................                                                    [100%]
+21 passed in 0.11s
 ```
 
 Кожен прогон друкує рядок `--- COST: ... ---` з витраченими токенами й доларами.
@@ -529,6 +631,8 @@ tools.py      три read-only інструменти + ToolError
 demos.py      п'ять прогонів для README
 challenge_a.py  челендж A: той самий запит на трьох версіях описів
 challenge_b.py  челендж B: батарея red-team атак
+challenge_d.py  челендж D: два однакові прогони, другий не створює дублікат
+incidents.json  журнал інцидентів (у .gitignore — це рантайм-артефакт)
 test_agent.py 11 тестів (стани + інструменти), офлайн
 fixtures/     фейковий кластер: CrashLoopBackOff, ImagePullBackOff, недоступний ns
 ```

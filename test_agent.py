@@ -6,7 +6,9 @@ import pytest
 from langchain_core.messages import AIMessage
 
 import agent
-from tools import ToolError, describe_pod, get_pod_logs, list_namespaces, list_unhealthy_pods
+import tools
+from tools import (ToolError, create_incident, describe_pod, get_pod_logs,
+                   list_namespaces, list_unhealthy_pods)
 
 NS = "shop-prod"
 CRASHER = "checkout-api-7d9f6c4b8-x9k2p"
@@ -163,3 +165,53 @@ def test_budget_stops_the_run_before_next_llm_call():
     assert llm.calls < 10  # зупинились раніше, ніж вичерпались кроки
     assert res.cost_usd >= 0.001 and "Бюджет вичерпано" in res.answer
     assert "checkout-api-7d9f6c4b8-x9k2p" in res.answer  # часткові знахідки не втрачені
+
+
+# --- дія з наслідками: підтвердження + ідемпотентність (челендж D) -----------
+
+@pytest.fixture
+def incidents(tmp_path, monkeypatch):
+    """Журнал інцидентів у тимчасовому файлі + лічильник питань до людини."""
+    path = tmp_path / "incidents.json"
+    monkeypatch.setattr(tools, "INCIDENTS", path)
+    asked = []
+    monkeypatch.setattr(tools, "CONFIRM", lambda q: (asked.append(q), True)[1])
+    return path, asked
+
+
+ARGS = {"namespace": NS, "pod_name": CRASHER, "summary": "CrashLoopBackOff: db auth",
+        "evidence": "password authentication failed for user \"checkout_rw\""}
+
+
+def test_incident_created_after_human_confirms(incidents):
+    path, asked = incidents
+    out = json.loads(create_incident.invoke(ARGS))
+    assert out["created"] and out["incident"]["id"] == "INC-0001"
+    assert len(asked) == 1 and CRASHER in asked[0]
+    assert len(json.loads(path.read_text())) == 1
+
+
+def test_repeat_does_not_create_duplicate(incidents):
+    """Повтор повертає той самий інцидент і НЕ питає людину вдруге."""
+    path, asked = incidents
+    first = json.loads(create_incident.invoke(ARGS))
+    second = json.loads(create_incident.invoke(dict(ARGS, summary="той самий інцидент, інші слова")))
+    assert second["created"] is False and second["reason"] == "duplicate"
+    assert second["incident"]["id"] == first["incident"]["id"]
+    assert len(json.loads(path.read_text())) == 1  # у файлі один запис
+    assert len(asked) == 1  # ідемпотентність спрацювала ДО підтвердження
+
+
+def test_declined_by_human_writes_nothing(incidents, monkeypatch):
+    path, _ = incidents
+    monkeypatch.setattr(tools, "CONFIRM", lambda q: False)
+    out = json.loads(create_incident.invoke(ARGS))
+    assert out["created"] is False and out["reason"] == "declined_by_human"
+    assert not path.exists()
+
+
+def test_no_incident_for_invented_pod(incidents):
+    path, asked = incidents
+    with pytest.raises(ToolError, match="do not guess"):
+        create_incident.func(NS, "payment-api", "вигаданий под", "нічого")
+    assert not asked and not path.exists()  # людину не питали, файл не створено

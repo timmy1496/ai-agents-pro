@@ -1,17 +1,23 @@
-"""Read-only інструменти SRE-агента поверх фікстур кластера.
+"""Інструменти SRE-агента поверх фікстур кластера.
 
-Свідомо read-only: інструмента, який щось ЗМІНЮЄ в кластері, тут немає.
-Це спроєктований стан «немає потрібного інструмента» — агент має віддати
-команду фіксу людині, а не вдавати, що виконав її.
+Усе, що стосується самого кластера, — read-only: інструмента, який ЗМІНЮЄ кластер
+(rollout restart, delete pod), тут немає навмисно. Це спроєктований стан «немає
+потрібного інструмента» — агент віддає команду фіксу людині, а не вдає, що виконав її.
+
+Єдина дія з наслідками — create_incident: створює запис у журналі інцидентів.
+Вона незворотна (запис бачать чергові), тому проходить два бар'єри: перевірку на
+дублікат і явне підтвердження людини — саме в такому порядку.
 """
 
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 from langchain_core.tools import tool
 
 FIXTURES = Path(os.getenv("SRE_FIXTURES", Path(__file__).parent / "fixtures" / "cluster.json"))
+INCIDENTS = Path(os.getenv("SRE_INCIDENTS", Path(__file__).parent / "incidents.json"))
 
 # Що вважаємо нездоровим: не Running, або не всі контейнери ready, або є перезапуски.
 _UNHEALTHY_PHASES = {"Pending", "Failed", "Unknown"}
@@ -19,6 +25,14 @@ _UNHEALTHY_PHASES = {"Pending", "Failed", "Unknown"}
 
 class ToolError(Exception):
     """Інструмент не зміг виконатись (аналог kubectl exit != 0)."""
+
+
+def _confirm_via_stdin(question: str) -> bool:
+    return input(f"\n[ПІДТВЕРДЖЕННЯ ЛЮДИНИ] {question} [y/N] ").strip().lower() in {"y", "yes", "т", "так"}
+
+
+# Підміняється в тестах і в демо. Дефолт — реальне питання в термінал.
+CONFIRM = _confirm_via_stdin
 
 
 def _load() -> dict:
@@ -152,7 +166,73 @@ def get_pod_logs(namespace: str, pod_name: str, previous: bool = False) -> str:
                        "found": True, "logs": text, "reason": None}, ensure_ascii=False)
 
 
-TOOLS = [list_namespaces, list_unhealthy_pods, describe_pod, get_pod_logs]
+def _incident_key(namespace: str, pod_name: str, reason: str | None) -> str:
+    """Природний ключ ідемпотентності: той самий под з тією ж причиною — той самий інцидент.
+
+    Свідомо НЕ включає summary: якщо ключем зробити текст від моделі, дублікат
+    створиться від будь-якого перефразування, і вся перевірка стане декорацією.
+    """
+    return f"{namespace}/{pod_name}/{reason or 'unknown'}"
+
+
+def _load_incidents() -> list:
+    try:
+        return json.loads(INCIDENTS.read_text())
+    except FileNotFoundError:
+        return []
+    except json.JSONDecodeError as e:
+        raise ToolError(f"журнал інцидентів пошкоджений ({INCIDENTS}): {e}")
+
+
+@tool
+def create_incident(namespace: str, pod_name: str, summary: str, evidence: str) -> str:
+    """Створює запис в журналі інцидентів. ЄДИНА дія з наслідками — усе інше read-only.
+
+    Створення незворотне: запис бачать чергові інженери. Тому інструмент сам, ДО запису:
+      1. перевіряє, чи інцидент для цього пода з цією причиною вже існує (ідемпотентність);
+      2. якщо ні — питає підтвердження в людини.
+    Обидва бар'єри всередині інструмента, не в твоїй відповідальності. Не проси дозволу
+    в тексті — просто виклич, людину спитають без тебе.
+
+    Викликай ТІЛЬКИ після того, як зібрав докази через describe_pod / get_pod_logs.
+    Не створюй інцидент на здоровий под і не вигадуй pod_name.
+
+    Args:
+        namespace: неймспейс пода.
+        pod_name: повне ім'я пода з list_unhealthy_pods.
+        summary: один рядок — що зламано.
+        evidence: конкретний рядок з логів або поля describe, на якому стоїть висновок.
+
+    Returns:
+        JSON: {"created": bool, "incident": {...}, "reason": str}
+        created=false з reason="duplicate" — інцидент уже є, повертається існуючий (це УСПІХ, не помилка).
+        created=false з reason="declined_by_human" — людина відмовила. Не обходь це і не повторюй виклик.
+
+    Raises:
+        ToolError: под не знайдено або журнал пошкоджений.
+    """
+    pod = _pod(namespace, pod_name)  # інцидент на неіснуючий под не створюється
+    key = _incident_key(namespace, pod_name, pod["reason"])
+    incidents = _load_incidents()
+
+    existing = next((i for i in incidents if i["key"] == key), None)
+    if existing:  # перевірка ПЕРЕД підтвердженням: не смикаємо людину на no-op
+        return json.dumps({"created": False, "incident": existing, "reason": "duplicate"},
+                          ensure_ascii=False)
+
+    if not CONFIRM(f"Створити інцидент для {namespace}/{pod_name} — {summary}?"):
+        return json.dumps({"created": False, "incident": None, "reason": "declined_by_human"},
+                          ensure_ascii=False)
+
+    incident = {"id": f"INC-{len(incidents) + 1:04d}", "key": key, "namespace": namespace,
+                "pod": pod_name, "reason": pod["reason"], "summary": summary,
+                "evidence": evidence, "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    incidents.append(incident)
+    INCIDENTS.write_text(json.dumps(incidents, ensure_ascii=False, indent=2) + "\n")
+    return json.dumps({"created": True, "incident": incident, "reason": "created"}, ensure_ascii=False)
+
+
+TOOLS = [list_namespaces, list_unhealthy_pods, describe_pod, get_pod_logs, create_incident]
 
 
 # --- Челендж A: експеримент «опис інструмента = поведінка агента» ------------
@@ -161,6 +241,7 @@ TOOLS = [list_namespaces, list_unhealthy_pods, describe_pod, get_pod_logs]
 _V2_DESCRIPTIONS = {t.name: t.description for t in TOOLS}
 _V1_DESCRIPTIONS = {
     "list_namespaces": "Повертає список неймспейсів.",
+    "create_incident": "Створює інцидент.\n\nArgs:\n    namespace, pod_name, summary, evidence.",
     "list_unhealthy_pods": "Повертає нездорові поди в неймспейсі.\n\nArgs:\n    namespace: назва неймспейсу.",
     "describe_pod": "Повертає деталі пода: контейнери, події, статуси.\n\nArgs:\n    namespace: неймспейс.\n    pod_name: ім'я пода.",
     "get_pod_logs": "Повертає логи пода.\n\nArgs:\n    namespace: неймспейс.\n    pod_name: ім'я пода.\n    previous: логи попереднього запуску.",
