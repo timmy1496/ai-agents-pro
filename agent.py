@@ -9,6 +9,7 @@
     turns_exhausted — вичерпано ліміт кроків, повертаємо часткові знахідки
     api_error       — LLM API недоступний після ретраїв
     no_tool_used    — модель хотіла відповісти «з голови», не торкнувшись кластера
+    budget_exhausted — вичерпано ліміт у доларах (жорсткіший за ліміт кроків)
 """
 
 import json
@@ -24,7 +25,16 @@ from tools import TOOLS, ToolError
 load_dotenv()
 
 MAX_STEPS = int(os.getenv("SRE_MAX_STEPS", "6"))
+MAX_USD = float(os.getenv("SRE_MAX_USD", "0.05"))
 API_RETRIES = 2
+
+# $ за 1M токенів (input, output), станом на 2026-08. Модель зовні цих таблиць не
+# коштує нуль — вона рахується за ставками gpt-4o-mini і це чесно позначено в price_note.
+PRICES_USD_PER_1M = {
+    "gpt-4o-mini": (0.15, 0.60),
+    "gpt-4o": (2.50, 10.00),
+    "gpt-4.1-mini": (0.40, 1.60),
+}
 _BY_NAME = {t.name: t for t in TOOLS}
 
 SYSTEM = """Ти SRE-асистент. Дебажиш проблеми в Kubernetes-кластері.
@@ -53,6 +63,17 @@ SYSTEM = """Ти SRE-асистент. Дебажиш проблеми в Kubern
 """
 
 
+def price_per_1m(model: str) -> tuple[float, float, str]:
+    """Ставки для моделі: (input, output, звідки взято). Префікс шлюзу («openai/») зрізається."""
+    name = model.split("/")[-1]
+    env_in, env_out = os.getenv("SRE_PRICE_IN"), os.getenv("SRE_PRICE_OUT")
+    if env_in and env_out:
+        return float(env_in), float(env_out), "env"
+    if name in PRICES_USD_PER_1M:
+        return (*PRICES_USD_PER_1M[name], "таблиця")
+    return (*PRICES_USD_PER_1M["gpt-4o-mini"], f"ПРИПУЩЕННЯ: {name} немає в таблиці, ставки gpt-4o-mini")
+
+
 @dataclass
 class Result:
     state: str
@@ -60,11 +81,34 @@ class Result:
     steps: list = field(default_factory=list)
     tool_calls: int = 0
     tool_errors: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: float = 0.0
+    price_note: str = ""
+
+    def add_usage(self, message, model: str) -> None:
+        """Додає токени відповіді до підсумку. Без usage_metadata вартість лишається 0 —
+        нуль тут означає «провайдер не сказав», а не «безкоштовно»; це видно в price_note."""
+        usage = getattr(message, "usage_metadata", None)
+        if not usage:
+            self.price_note = self.price_note or "провайдер не повернув usage_metadata — вартість невідома"
+            return
+        p_in, p_out, note = price_per_1m(model)
+        self.price_note = note
+        self.input_tokens += usage["input_tokens"]
+        self.output_tokens += usage["output_tokens"]
+        self.cost_usd += usage["input_tokens"] / 1e6 * p_in + usage["output_tokens"] / 1e6 * p_out
+
+    @property
+    def cost_line(self) -> str:
+        return (f"tokens: {self.input_tokens} in + {self.output_tokens} out, "
+                f"cost: ${self.cost_usd:.6f} [{self.price_note or 'n/a'}]")
 
     def __str__(self) -> str:
         trace = "\n".join(f"  {i}. {s}" for i, s in enumerate(self.steps, 1))
         return (f"--- TRACE ---\n{trace}\n--- STATE: {self.state} "
-                f"(tools: {self.tool_calls}, errors: {self.tool_errors}) ---\n{self.answer}")
+                f"(tools: {self.tool_calls}, errors: {self.tool_errors}) ---\n"
+                f"--- COST: {self.cost_line} ---\n{self.answer}")
 
 
 def build_llm():
@@ -103,13 +147,25 @@ def _call_tool(call: dict) -> tuple[str, bool]:
         return f"ERROR: {type(e).__name__}: {e}", True
 
 
-def run(question: str, llm=None, max_steps: int = MAX_STEPS) -> Result:
+def run(question: str, llm=None, max_steps: int = MAX_STEPS,
+        max_usd: float = MAX_USD, model: str | None = None) -> Result:
     llm = llm or build_llm()
+    model = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
     messages = [SystemMessage(SYSTEM), HumanMessage(question)]
     res = Result(state="", answer="")
     facts: list[str] = []  # успішні tool-результати, для часткової відповіді
 
     for step in range(1, max_steps + 1):
+        # Бюджет перевіряється ПЕРЕД викликом: ліміт кроків обмежує довжину, ліміт у
+        # доларах — реальні гроші, і довгий контекст дорожчає швидше, ніж росте лічильник кроків.
+        if res.cost_usd >= max_usd:
+            res.state = "budget_exhausted"
+            res.steps.append(f"крок {step}: бюджет ${max_usd:.6f} вичерпано (${res.cost_usd:.6f}) — зупинка до виклику LLM")
+            res.answer = (f"Бюджет вичерпано: ${res.cost_usd:.6f} з ліміту ${max_usd:.6f}. "
+                          f"Зупиняюсь, діагноз НЕ поставлений — не вигадую його.\n"
+                          f"Що встиг зібрати:\n" + ("\n".join(f"- {f[:300]}" for f in facts) or "- нічого") +
+                          f"\nПідніми SRE_MAX_USD або звузь питання.")
+            return res
         try:
             ai = _invoke(llm, messages, res.steps)
         except Exception as e:
@@ -117,6 +173,7 @@ def run(question: str, llm=None, max_steps: int = MAX_STEPS) -> Result:
             res.answer = (f"Не можу відповісти: LLM API недоступний після {API_RETRIES + 1} спроб "
                           f"({type(e).__name__}: {e}). Дані з кластера не зібрані — жодних висновків не роблю.")
             return res
+        res.add_usage(ai, model)
         messages.append(ai)
 
         if not ai.tool_calls:

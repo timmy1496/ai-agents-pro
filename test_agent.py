@@ -16,9 +16,13 @@ class ScriptedLLM:
     """Віддає заздалегідь задані відповіді моделі. Рядок = фінальна відповідь,
     (tool, args) = виклик інструмента, Exception = падіння API."""
 
-    def __init__(self, *script):
+    def __init__(self, *script, usage=None):
         self.script = list(script)
         self.calls = 0
+        self.usage = usage  # {"input_tokens": .., "output_tokens": .., "total_tokens": ..}
+
+    def _usage(self):
+        return dict(self.usage) if self.usage else None
 
     def invoke(self, messages):
         self.calls += 1
@@ -27,9 +31,9 @@ class ScriptedLLM:
             raise item
         if isinstance(item, tuple):
             name, args = item
-            return AIMessage(content="", tool_calls=[
+            return AIMessage(content="", usage_metadata=self._usage(), tool_calls=[
                 {"name": name, "args": args, "id": f"call_{self.calls}", "type": "tool_call"}])
-        return AIMessage(content=item)
+        return AIMessage(content=item, usage_metadata=self._usage())
 
 
 # --- інструменти ------------------------------------------------------------
@@ -98,9 +102,17 @@ def test_state_no_tool_used():
 
 
 def test_state_tool_error():
+    """Помилка інструмента не валить процес, і в модель іде саме текст причини.
+
+    Перевіряється не лише стан: у трейсі має бути рівно те повідомлення, яке модель
+    прочитає. Без цієї частини тест не ловив би підміну обробника на загальний
+    except Exception — див. розділ «Мутаційна перевірка» в README.
+    """
     llm = ScriptedLLM(("list_unhealthy_pods", {"namespace": "flaky-ns"}), "Мабуть, все добре.")
     res = agent.run("що з flaky-ns", llm=llm)
     assert res.state == "tool_error" and res.tool_errors == 1
+    assert "ERROR: Unable to connect to the server" in res.steps[0]
+    assert "ToolError" not in res.steps[0]  # клас винятку — шум, модель має бачити причину
 
 
 def test_state_turns_exhausted():
@@ -117,3 +129,37 @@ def test_state_api_error(monkeypatch):
     res = agent.run("що зламалось", llm=llm)
     assert res.state == "api_error"
     assert llm.calls == agent.API_RETRIES + 1  # ретраї відпрацювали й зупинились
+
+
+# --- бюджет і вартість (челендж C) ------------------------------------------
+
+USAGE = {"input_tokens": 1000, "output_tokens": 500, "total_tokens": 1500}
+
+
+def test_cost_is_counted_per_call():
+    llm = ScriptedLLM(("list_unhealthy_pods", {"namespace": NS}), "ДІАГНОЗ: ...", usage=USAGE)
+    res = agent.run("що зламалось", llm=llm, model="gpt-4o-mini")
+    # два виклики моделі: 2*(1000 in + 500 out) за ставками 0.15 / 0.60 за 1M
+    assert res.input_tokens == 2000 and res.output_tokens == 1000
+    assert res.cost_usd == pytest.approx(2000 / 1e6 * 0.15 + 1000 / 1e6 * 0.60)
+
+
+def test_unknown_model_is_flagged_not_free():
+    llm = ScriptedLLM("відповідь", usage=USAGE)
+    res = agent.run("щось", llm=llm, model="some/unknown-model-v9")
+    assert res.cost_usd > 0 and "ПРИПУЩЕННЯ" in res.price_note
+
+
+def test_missing_usage_is_flagged_not_free():
+    res = agent.run("щось", llm=ScriptedLLM("відповідь"))  # usage=None
+    assert res.cost_usd == 0 and "не повернув usage_metadata" in res.price_note
+
+
+def test_budget_stops_the_run_before_next_llm_call():
+    """Ліміт у доларах жорсткіший за ліміт кроків: кроки ще є, гроші вже ні."""
+    llm = ScriptedLLM(*[("list_unhealthy_pods", {"namespace": NS})] * 10, usage=USAGE)
+    res = agent.run("що зламалось", llm=llm, max_steps=10, max_usd=0.001, model="gpt-4o-mini")
+    assert res.state == "budget_exhausted"
+    assert llm.calls < 10  # зупинились раніше, ніж вичерпались кроки
+    assert res.cost_usd >= 0.001 and "Бюджет вичерпано" in res.answer
+    assert "checkout-api-7d9f6c4b8-x9k2p" in res.answer  # часткові знахідки не втрачені
