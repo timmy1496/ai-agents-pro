@@ -6,7 +6,7 @@ import pytest
 from langchain_core.messages import AIMessage
 
 import agent
-from tools import ToolError, describe_pod, get_pod_logs, list_unhealthy_pods
+from tools import ToolError, describe_pod, get_pod_logs, list_namespaces, list_unhealthy_pods
 
 NS = "shop-prod"
 CRASHER = "checkout-api-7d9f6c4b8-x9k2p"
@@ -44,6 +44,17 @@ def test_list_finds_only_unhealthy():
 def test_healthy_namespace_is_found_false_not_error():
     out = json.loads(list_unhealthy_pods.invoke({"namespace": "billing"}))
     assert out["found"] is False and out["pods"] == []
+
+
+def test_list_namespaces_returns_real_names():
+    out = json.loads(list_namespaces.invoke({}))
+    assert out["found"] and {"shop-prod", "billing", "flaky-ns"} == set(out["namespaces"])
+
+
+def test_unknown_namespace_points_at_list_namespaces():
+    """Челендж B/b4: помилка має вести до інструмента, а не заохочувати вгадувати далі."""
+    with pytest.raises(ToolError, match="Call list_namespaces"):
+        list_unhealthy_pods.func("no-such-ns")
 
 
 def test_unknown_namespace_raises():

@@ -35,7 +35,8 @@ def _namespace(name: str) -> dict:
     if ns is None:
         raise ToolError(
             f'namespace "{name}" not found. Error from server (NotFound): '
-            f"namespaces \"{name}\" not found"
+            f'namespaces "{name}" not found. '
+            f"Call list_namespaces to get the real list — do not guess namespace names."
         )
     if "_error" in ns:  # імітація недоступного кластера
         raise ToolError(ns["_error"])
@@ -55,6 +56,20 @@ def _pod(namespace: str, pod_name: str) -> dict:
 def _is_unhealthy(pod: dict) -> bool:
     ready, _, total = pod["ready"].partition("/")
     return pod["phase"] in _UNHEALTHY_PHASES or ready != total or pod["restarts"] > 0
+
+
+@tool
+def list_namespaces() -> str:
+    """Перелік усіх неймспейсів кластера (як `kubectl get namespaces`).
+
+    Виклич це, якщо користувач НЕ назвав конкретний неймспейс або просить перевірити
+    «весь кластер». Не вгадуй імена неймспейсів — їх не можна вивести з голови.
+
+    Returns:
+        JSON: {"found": bool, "namespaces": ["shop-prod", ...]}
+    """
+    names = sorted(_load()["namespaces"])
+    return json.dumps({"found": bool(names), "namespaces": names}, ensure_ascii=False)
 
 
 @tool
@@ -137,7 +152,7 @@ def get_pod_logs(namespace: str, pod_name: str, previous: bool = False) -> str:
                        "found": True, "logs": text, "reason": None}, ensure_ascii=False)
 
 
-TOOLS = [list_unhealthy_pods, describe_pod, get_pod_logs]
+TOOLS = [list_namespaces, list_unhealthy_pods, describe_pod, get_pod_logs]
 
 
 # --- Челендж A: експеримент «опис інструмента = поведінка агента» ------------
@@ -145,6 +160,7 @@ TOOLS = [list_unhealthy_pods, describe_pod, get_pod_logs]
 # але без контракту ланцюжка і без семантики found=false.
 _V2_DESCRIPTIONS = {t.name: t.description for t in TOOLS}
 _V1_DESCRIPTIONS = {
+    "list_namespaces": "Повертає список неймспейсів.",
     "list_unhealthy_pods": "Повертає нездорові поди в неймспейсі.\n\nArgs:\n    namespace: назва неймспейсу.",
     "describe_pod": "Повертає деталі пода: контейнери, події, статуси.\n\nArgs:\n    namespace: неймспейс.\n    pod_name: ім'я пода.",
     "get_pod_logs": "Повертає логи пода.\n\nArgs:\n    namespace: неймспейс.\n    pod_name: ім'я пода.\n    previous: логи попереднього запуску.",
@@ -153,7 +169,7 @@ _V1_DESCRIPTIONS = {
 
 _CHAIN_HINT = "\n\nІмена подів беруться ТІЛЬКИ з list_unhealthy_pods. Вигадане ім'я поверне помилку."
 # V1+chain: наївний опис ПЛЮС одне речення про ланцюжок — щоб виміряти, що саме вирішує.
-_V1_CHAIN_DESCRIPTIONS = {n: d + (_CHAIN_HINT if n != "list_unhealthy_pods" else "")
+_V1_CHAIN_DESCRIPTIONS = {n: d + (_CHAIN_HINT if n.startswith(("describe", "get_")) else "")
                           for n, d in _V1_DESCRIPTIONS.items()}
 _VARIANTS = {"v1": _V1_DESCRIPTIONS, "v1_chain": _V1_CHAIN_DESCRIPTIONS, "v2": _V2_DESCRIPTIONS}
 
