@@ -138,3 +138,27 @@ def get_pod_logs(namespace: str, pod_name: str, previous: bool = False) -> str:
 
 
 TOOLS = [list_unhealthy_pods, describe_pod, get_pod_logs]
+
+
+# --- Челендж A: експеримент «опис інструмента = поведінка агента» ------------
+# V2 = описи вище (docstring'и). V1 = наївна перша версія: технічно правдива,
+# але без контракту ланцюжка і без семантики found=false.
+_V2_DESCRIPTIONS = {t.name: t.description for t in TOOLS}
+_V1_DESCRIPTIONS = {
+    "list_unhealthy_pods": "Повертає нездорові поди в неймспейсі.\n\nArgs:\n    namespace: назва неймспейсу.",
+    "describe_pod": "Повертає деталі пода: контейнери, події, статуси.\n\nArgs:\n    namespace: неймспейс.\n    pod_name: ім'я пода.",
+    "get_pod_logs": "Повертає логи пода.\n\nArgs:\n    namespace: неймспейс.\n    pod_name: ім'я пода.\n    previous: логи попереднього запуску.",
+}
+
+
+_CHAIN_HINT = "\n\nІмена подів беруться ТІЛЬКИ з list_unhealthy_pods. Вигадане ім'я поверне помилку."
+# V1+chain: наївний опис ПЛЮС одне речення про ланцюжок — щоб виміряти, що саме вирішує.
+_V1_CHAIN_DESCRIPTIONS = {n: d + (_CHAIN_HINT if n != "list_unhealthy_pods" else "")
+                          for n, d in _V1_DESCRIPTIONS.items()}
+_VARIANTS = {"v1": _V1_DESCRIPTIONS, "v1_chain": _V1_CHAIN_DESCRIPTIONS, "v2": _V2_DESCRIPTIONS}
+
+
+def set_descriptions(variant: str) -> None:
+    """Перемикає описи інструментів між версіями: v1 (наївна), v1_chain, v2 (робоча)."""
+    for t in TOOLS:
+        t.description = _VARIANTS[variant][t.name]

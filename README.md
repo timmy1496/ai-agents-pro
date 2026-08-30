@@ -150,6 +150,101 @@ $ .venv/bin/python demos.py api_error
 
 Три спроби з backoff 1s/2s, далі відмова. Стектрейсу назовні немає, є причина.
 
+## Челендж A — опис інструмента = поведінка агента
+
+Експеримент: `challenge_a.py`. Логіка інструментів **не змінюється взагалі** — між
+прогонами перемикається лише текст, який читає модель (`tools.set_descriptions`).
+
+**Запит, що ламає агента:** `Покажи логи checkout-api у неймспейсі shop-prod.`
+
+Людина називає сервіс коротким іменем. `checkout-api` — це ім'я *контейнера*, а под
+називається `checkout-api-7d9f6c4b8-x9k2p`, і взяти це ім'я можна тільки з першого
+інструмента.
+
+### Опис V1 — наївний, «як пишеш з першого разу»
+
+```
+list_unhealthy_pods: Повертає нездорові поди в неймспейсі.
+                     Args: namespace — назва неймспейсу.
+describe_pod:        Повертає деталі пода: контейнери, події, статуси.
+                     Args: namespace — неймспейс. pod_name — ім'я пода.
+get_pod_logs:        Повертає логи пода.
+                     Args: namespace — неймспейс. pod_name — ім'я пода. previous — логи попереднього запуску.
+```
+
+Кожне слово тут правда. Немає лише одного: звідки береться `pod_name`.
+
+```
+----- V1 (наївний опис) -----
+  1. крок 1: get_pod_logs({"namespace": "shop-prod", "pod_name": "checkout-api"}) -> ERROR ERROR: pod "checkout-api" not found in namespace "shop-prod". Get a real pod name from list_unhealthy_pods first — do not guess names.
+  2. крок 2: list_unhealthy_pods({"namespace": "shop-prod"}) -> {"namespace": "shop-prod", "found": true, "unhealthy_count": 2, ...}
+  3. крок 3: describe_pod({"namespace": "shop-prod", "pod_name": "checkout-api-7d9f6c4b8-x9k2p"}) -> {...}
+  4. крок 3: get_pod_logs({"namespace": "shop-prod", "pod_name": "checkout-api-7d9f6c4b8-x9k2p"}) -> {..."found": true...}
+--- STATE: ok (tools: 4, errors: 1) ---
+```
+
+Модель підставила ім'я контейнера в `pod_name` — саме та плутанина аргументів, яку
+шукали. Ланцюжок пішов з середини, перший виклик спалено даремно.
+
+### Опис V2 — робочий (docstring'и в `tools.py`)
+
+```
+list_unhealthy_pods: Список нездорових подів у неймспейсі: не Running, не всі контейнери ready,
+                     або з перезапусками.
+
+                     ЦЕ ПЕРШИЙ КРОК будь-якого розслідування. Імена подів беруться ТІЛЬКИ звідси —
+                     describe_pod і get_pod_logs потребують точного імені пода з цього списку.
+                     ...
+                     found=false означає, що нездорових подів НЕМАЄ — це валідна відповідь, не помилка.
+
+get_pod_logs:        Логи контейнера пода (як `kubectl logs`). Для CrashLoopBackOff бери previous=true.
+
+                     Потребує ТОЧНОГО імені пода, отриманого з list_unhealthy_pods.
+                     Вигадане ім'я поверне помилку.
+                     ...
+                     previous: true — логи попереднього (вбитого) запуску контейнера. Для пода, що
+                         падає в циклі, поточні логи часто порожні, а причина саме в previous.
+```
+
+```
+----- V2 (робочий опис) -----
+  1. крок 1: list_unhealthy_pods({"namespace": "shop-prod"}) -> {..."unhealthy_count": 2...}
+  2. крок 2: describe_pod({"namespace": "shop-prod", "pod_name": "checkout-api-7d9f6c4b8-x9k2p"}) -> {...}
+  3. крок 3: get_pod_logs({"namespace": "shop-prod", "pod_name": "checkout-api-7d9f6c4b8-x9k2p", "previous": true}) -> {..."found": true...}
+--- STATE: ok (tools: 3, errors: 0) ---
+```
+
+Помилка зникла. Плюс модель сама взяла `previous=true` — для CrashLoopBackOff це
+правильні логи, і це теж прийшло з опису, а не з системного промпту.
+
+### Що саме вирішило
+
+Щоб не приписувати заслугу всьому переписаному тексту, є третій прогон: V1 **плюс
+одне речення**, дописане до `describe_pod` і `get_pod_logs`, більше нічого:
+
+> `Імена подів беруться ТІЛЬКИ з list_unhealthy_pods. Вигадане ім'я поверне помилку.`
+
+```
+----- V1 + одне речення про ланцюжок -----
+  1. крок 1: list_unhealthy_pods({"namespace": "shop-prod"}) -> {..."unhealthy_count": 2...}
+  2. крок 2: get_pod_logs({"namespace": "shop-prod", "pod_name": "checkout-api-7d9f6c4b8-x9k2p"}) -> {..."found": true...}
+--- STATE: ok (tools: 2, errors: 0) ---
+```
+
+**Висновок:** помилку прибрало не багатослів'я опису, а одна конкретна річ — вказівка
+на **походження аргументу**. Опис відповідав на питання «що це за поле», але не на
+«звідки його взяти»; модель заповнила пробіл найправдоподібнішим рядком із запиту
+користувача. Решта V2 (порядок кроків, семантика `found=false`, підказка про
+`previous=true`) впливає на **якість** розслідування, а не на цю помилку.
+
+Два чесні уточнення:
+- Половину роботи робить **текст помилки інструмента**: на V1 агент виліз із ями сам,
+  бо `ToolError` містить `Get a real pod name from list_unhealthy_pods first`. Опис і
+  повідомлення про помилку — це один контракт, просто читаються в різні моменти.
+- Прогони не строго детерміновані навіть на `temperature=0`: V2 в одному запуску дав
+  2 виклики, в іншому 3 (з `describe_pod` посередині). Стабільно відтворюється саме
+  зникнення помилки аргументу, а не точна кількість кроків.
+
 ## Тести
 
 Скриптована LLM (`ScriptedLLM` у `test_agent.py`) підміняє модель — усі п'ять станів
@@ -167,6 +262,7 @@ $ .venv/bin/python -m pytest -q
 agent.py      цикл, п'ять станів, ретраї, ліміт кроків
 tools.py      три read-only інструменти + ToolError
 demos.py      п'ять прогонів для README
+challenge_a.py  експеримент челенджу A: той самий запит на трьох версіях описів
 test_agent.py 11 тестів (стани + інструменти), офлайн
 fixtures/     фейковий кластер: CrashLoopBackOff, ImagePullBackOff, недоступний ns
 ```
